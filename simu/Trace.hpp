@@ -10,37 +10,32 @@
 #define ONEHOUR 3600
 
 
-class Trace
-{
+class Trace {
 public:
-    Trace(double mu, double length = ONEYEAR) :
-        mu(mu), i(0)
-    {
+    Trace(double mu, double length = ONEYEAR) : mu(mu), i(0) {
         p = 0;
         nF = 0;
-        while(p < length)
-        {
-            double u = (double)rand() / (double)RAND_MAX;
-            double X = -log(u)*mu;
-            errors.push_back(p+X);
+        while (p < length) {
+            double u = (double) rand() / (double) RAND_MAX;
+            double X = -log(u) * mu;
+            errors.push_back(p + X);
             p += X;
             nF++;
         }
         horizon = length;
     }
 
-    double next(double t)
-    {
-        while(t >= errors[i] && i < errors.size())
+    double next(double t) {
+        while (i < errors.size() && t >= errors[i])
             i++;
-        if(i >= errors.size())
-        {
-            return horizon+0.1;
+        if (i >= errors.size()) {
+            return horizon + 0.1;
         }
         return errors[i];
     }
+
     void initI() {
-        i=0;
+        i = 0;
     }
 
     double mu;
