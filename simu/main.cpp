@@ -22,7 +22,7 @@
 #include <getopt.h>
 #include <random>
 #include <unordered_set>
-#include "Trace1.hpp"
+#include "Trace.hpp"
 
 #define INF std::numeric_limits<double>::max();
 
