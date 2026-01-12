@@ -1,13 +1,13 @@
+import time
 
-from strategy import Strategy
-import util
+from Base.strategy import Strategy
+from Base import util
 
 
-class CkptCrossover(Strategy):
-    def __init__(self, w, G, P, p_fail, lam, ccc, vvv,ccr):
-        super().__init__(w, G, P, p_fail, lam, ccc, vvv,ccr)
+class CPA13CkptAll(Strategy):
+    def __init__(self, w, G, P, p_fail, lam, gamma, eta,ccr):
+        super().__init__(w, G, P, p_fail, lam, gamma, eta,ccr)
         self.mapping_order = []
-        self.nb_c = 0
 
     def allocation(self):
         visited = {}
@@ -104,51 +104,24 @@ class CkptCrossover(Strategy):
             current_start_time = last_start_time
         return better_np
 
-    # checkpoint tasks with crossover dependences
     def checkpoint(self):
-        tmpCkpt = []
         for node in self.G.nodes:
-            if self.G.out_degree(node) == 0:
-                tmpCkpt.append(node)
-            else:
-                for succ in self.G.successors(node):
-                    if self.alloc[succ] != self.alloc[node]:
-                        tmpCkpt.append(node)
-                        break
-                    else:
-                        pros = self.alloc[node]
-                        tag = False
-                        for pro in pros:
-                            i1 = self.schedule[pro].index(node)
-                            if (self.schedule[pro][i1 + 1] != succ):
-                                tmpCkpt.append(node)
-                                tag = True
-                                break
-                    if tag:
-                        break
-
-        for node in tmpCkpt:
-            fs = {}
-            p = self.alloc[node][0]
-            curr = self.schedule[p].index(node)
-            lastCkpt = curr - 1
-            while lastCkpt >= 0 and self.schedule[p][lastCkpt] not in tmpCkpt:
-                lastCkpt -= 1
-            for i in range(lastCkpt + 1, curr + 1):
-                fs.update({self.schedule[p][i]: self.G.nodes[self.schedule[p][i]]['ck_ext']})
-                for succ in self.G.successors(self.schedule[p][i]):
-                    if succ not in self.schedule[p][lastCkpt + 1:curr + 1]:
-                        fs.update(self.G.edges[self.schedule[p][i], succ]['filelist'])
+            fs = {node: self.G.nodes[node]['ck_ext']}
+            for succ in self.G.successors(node):
+                fs.update(self.G.edges[node,succ]['filelist'])
             self.ckpt[node][0] = 1
-            self.ckpt[node][1] = sum(fs.values()) * self.ccc
-            self.ckpt[node][2] = sum(fs.values()) * self.vvv
+            self.ckpt[node][1] = sum(fs.values()) * self.gamma
+            self.ckpt[node][2] = sum(fs.values()) * self.eta
 
     def get_schedule(self, outdir):
+        start=time.perf_counter()
         self.allocation()
         self.shrink_mapping()
         self.checkpoint()
-        filename = f"{outdir}/1_{self.w}_{self.P}_{self.p_fail}_{self.ccr:.1e}.csv"
+        end = time.perf_counter()
+        filename = f"{outdir}/0_{self.w}_{self.P}_{self.p_fail}_{self.ccr:.1e}.csv"
         self.output2csv(filename)
+        return end-start,self.get_makespan()
 
     def get_makespan(self):
         ft = {}

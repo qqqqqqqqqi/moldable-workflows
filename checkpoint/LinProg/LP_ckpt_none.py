@@ -1,55 +1,72 @@
-import util
-from strategy import Strategy
+import csv
+import time
+
+from Base import util
+from Base.strategy import Strategy
+from Solver.algorithm_Chen13 import *
+from Solver.mixtesim import *
 
 
-class CkptNone(Strategy):
-    def __init__(self, w, G, P, p_fail, lam, ccc, vvv,ccr):
-        super().__init__(w, G, P, p_fail, lam, ccc, vvv, ccr)
+class LPCkptNone(Strategy):
+    def __init__(self, w, G, P, p_fail, lam, gamma, eta, ccr):
+        super().__init__(w, G, P, p_fail, lam, gamma, eta, ccr)
 
     def allocation(self):
-        visited = {}
-        A = {}
-        alloc = {}
+        dag_parser = DagParser()
+        dag = dag_parser.parse(self.G)
 
-        for node in self.G.nodes:
-            self.assign[node] = 1
-            visited[node] = 0
-            A[node] = [i for i in range(1, self.P + 1)]
-            ko = 0
-            size = self.G.nodes[node]['weight']
-            alpha = self.G.nodes[node]['alpha']
-            self.G.nodes[node]['d_weight'] = util.amdahl(size, alpha, self.assign[node])
-            alloc[node] = []
-            for k in range(1, len(A[node])):
-                pj_ko = util.amdahl(size, alpha, A[node][ko])
-                pj_k = util.amdahl(size, alpha, A[node][k])
-                benefit = util.compute_benefit(pj_ko, pj_k, A[node][ko], A[node][k])
-                rel_improvement = util.compute_rel_runtime_improvement(pj_ko, pj_k)
-                if benefit > 0 and rel_improvement >= util.THRESHOLD:
-                    ko = k
-                    alloc[node].append([A[node][k], benefit])
+        grid_parser = MixteSimPlatformParser()
+        grid = grid_parser.parse(self.P)
+        stats = {
+            "lp_write_start": 0,
+            "lp_write_end": 0,
+            "lp_size_bytes": 0
+        }
 
-        L, v_cp = util.compute_L(self.G)
-        W = util.compute_W(self.G, self.assign)
-        tl = util.compute_pred_level(self.G)[0]
-        while L > W / self.P:
-            vb, ab, bb = None, self.P, 0.0
-            md = util.computeMd(tl, visited, self.assign)
-            for node in v_cp:
-                if len(alloc[node]) == 0: continue
-                bf, a = alloc[node][0][1], alloc[node][0][0]
-                s = a - self.assign[node]
-                if md[tl[node]] + s <= self.P and bf > bb:
-                    vb, ab, bb = node, a, bf
-            if vb is not None:
-                self.assign[vb] = ab
-                self.G.nodes[vb]['d_weight'] = util.amdahl(self.G.nodes[vb]['weight'], self.G.nodes[vb]['alpha'], ab)
-                alloc[vb].pop(0)
-                visited[vb] = 1
-                L, v_cp = util.compute_L(self.G)
-                W = util.compute_W(self.G, self.assign)
-            else:
-                break
+        compNodeId2Id = {}
+        fakeId2compNode = {}
+        nodeId = 1
+        for node in dag.get_computational_nodes():
+            compNodeId2Id[node.id] = nodeId
+            fakeId2compNode[nodeId] = node
+            nodeId += 1
+        lpcreator = LpCreatorChen13(compNodeId2Id, fakeId2compNode)
+        solver = CplexGlpkSolverChen13()
+        producer = Chen13Producer(compNodeId2Id, fakeId2compNode)
+        stats["lp_write_start"] = time.time()
+        prog_str = lpcreator.create_linear_program(dag, grid)
+
+        out = sys.stdout
+        ofile = f'{self.w}_{self.P}.mod'
+        if ofile is not None:
+            out = open(ofile, "w")
+
+        out.write(prog_str)
+
+        if ofile is not None:
+            out.close()
+
+        lp_out_fname = ofile.replace(".mod", ".sol")
+
+        solver.solve(ofile, lp_out_fname)
+
+        res_hash = solver.read_result(lp_out_fname)
+
+        # solution = {} | node.id -> [ psize, time ]
+        solution = producer.get_solution(res_hash, dag, grid, None)
+        stats["lp_write_end"] = time.time()
+
+        out = sys.stdout
+
+        for jobid in solution.keys():
+            print(f"@SOLUTION[task,psize]: {jobid} {solution[jobid][0]}", file=out)
+            nd = str(jobid)
+            self.assign[nd] = int(solution[jobid][0])
+            self.G.nodes[nd]['d_weight'] = util.amdahl(self.G.nodes[nd]['weight'], self.G.nodes[nd]['alpha'],
+                                                       self.assign[nd])
+        with open("runtime.csv", "a", newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(["ckptNone", self.w, self.P, stats["lp_write_end"] - stats["lp_write_start"]])
 
     def shrink_mapping(self):
         ticks = []
@@ -60,7 +77,7 @@ class CkptNone(Strategy):
 
         ft = {}  # the finish time of each task
         stime = {node: 0.0 for node in self.G.nodes}
-
+        A = {}
         while (scheduleNb > 0):
             for a in self.avail:
                 self.avail[a] = max(self.avail[a], current)
@@ -102,19 +119,23 @@ class CkptNone(Strategy):
             current_start_time = last_start_time
         return better_np
 
+    # ckptnone only checkpointnew sink tasks at the end
     def checkpoint(self):
         for node in self.G.nodes:
             if self.G.out_degree(node) == 0:
                 ck_ext = self.G.nodes[node]['ck_ext']
-                self.ckpt[node] = [0, ck_ext * self.ccc, ck_ext * self.vvv]
+                self.ckpt[node] = [0, ck_ext * self.gamma, ck_ext * self.eta]
 
 
     def get_schedule(self, outdir):
+        start = time.perf_counter()
         self.allocation()
         self.shrink_mapping()
         self.checkpoint()
+        end = time.perf_counter()
         filename = f"{outdir}/6_{self.w}_{self.P}_{self.p_fail}_{self.ccr:.1e}.csv"
         self.output2csv(filename)
+        return end - start, self.get_makespan()
 
 
     def get_makespan(self):

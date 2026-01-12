@@ -1,13 +1,14 @@
+import csv
 import json
 import random
 import uuid
+
 import networkx as nx
 
 
-
-# WfGen
-def build_workflow(filename):
-    filename = f"../WfGen/{filename}.json"
+# wfgen
+def build_workflow(fn):
+    filename = f"../WFGen/{fn}.json"
     with open(filename, 'r') as f:
         json_data = f.read()
     data = json.loads(json_data)
@@ -30,8 +31,7 @@ def build_workflow(filename):
             file_weight[c['name']] = c['sizeInBytes']
         comm+=ck
         comp+=t['runtimeInSeconds']
-        G.add_node(t['name'], weight=t['runtimeInSeconds'], ck=ck, rv=rv, ck_ext=0, alpha=random.uniform(0, 0.25))
-
+        G.add_node(t['name'],size=t['runtimeInSeconds'], weight=t['runtimeInSeconds'], ck=ck, rv=0, ck_ext=0, alpha=random.uniform(0,0.25))
     for t in data['workflow']['tasks']:
         if len(t['children']) == 0:
             # exit output
@@ -44,19 +44,22 @@ def build_workflow(filename):
                     if f in dep[c][1]:  # input of child
                         w[f] = file_weight[f]
                         temp += file_weight[f]
+                        G.nodes[c]['rv']+=w[f]
                 G.add_edge(t['name'], c, filelist=w, temp=temp)
     return G,comm/comp
 
 
 # daggen
-def build_random_dag(filename,plat):
-    tG = nx.nx_agraph.read_dot(f'./DAGGEN/{filename}')
+def build_random_dag(filename, nb, plat):
+    tG = nx.nx_agraph.read_dot(f'../Daggen/{nb}/{filename}')
     G = nx.DiGraph()
     comm=0
     comp=0
     for node in tG.nodes:
         comp += int(tG.nodes[node]['size'])/plat.flops
-        G.add_node(node, weight=float(tG.nodes[node]['size']) / plat.flops, alpha=float(tG.nodes[node]['alpha']))
+        G.add_node(node,weight=float(tG.nodes[node]['size'])/plat.flops,alpha=float(tG.nodes[node]['alpha']))
+        if 'rv' not in G.nodes[node]:
+            G.nodes[node]['rv'] = 0
         ck = 0
         succs = list(tG.successors(node))
         if succs:
@@ -66,7 +69,10 @@ def build_random_dag(filename,plat):
             f = str(uuid.uuid4())
             for succ in succs:
                 G.add_edge(node, succ, filelist={f: transfer}, temp=transfer)
+                if 'rv' in G.nodes[succ]:
+                    G.nodes[succ]['rv'] +=transfer
+                else:
+                    G.nodes[succ]['rv']=transfer
         G.nodes[node]['ck'] = ck
         G.nodes[node]['ck_ext'] = 0
     return G,comm/comp
-

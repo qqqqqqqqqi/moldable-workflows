@@ -1,64 +1,79 @@
-import math
+import csv
+import time
+
 from math import inf
 
-import networkx as nx
-from strategy import Strategy
-import util
+from Base.strategy import Strategy
+from Base import util
+from Solver.algorithm_Chen13 import *
+from Solver.mixtesim import *
 
-class CkptChainOptimization(Strategy):
-    def __init__(self, w, G, P, p_fail, lam, ccc, vvv,ccr):
-        super().__init__(w, G, P, p_fail, lam, ccc, vvv,ccr)
+
+class LPCkptRight(Strategy):
+    def __init__(self, w, G, P, p_fail, lam, gamma, eta, ccr):
+        super().__init__(w, G, P, p_fail, lam, gamma, eta, ccr)
         self.mG = nx.DiGraph()
         self.chain2node = {}  # [chain:node]
         self.node2chain = {}  # [node: chain]
         self.mapping_order = []
+        self.dp_time = 0
 
     def allocation(self):
-        visited = {}
-        A = {}
-        alloc = {}
+        dag_parser = DagParser()
+        dag = dag_parser.parse(self.mG)
 
-        for node in self.mG.nodes:
-            self.assign[node] = 1
-            visited[node] = 0
-            A[node] = [i for i in range(1, self.P + 1)]
-            ko = 0
-            size = self.mG.nodes[node]['weight']
-            alpha = self.mG.nodes[node]['alpha']
-            self.mG.nodes[node]['d_weight'] = util.amdahlM(size, alpha, self.assign[node])
+        grid_parser = MixteSimPlatformParser()
+        grid = grid_parser.parse(self.P)
+        stats = {
+            "lp_write_start": 0,
+            "lp_write_end": 0,
+            "lp_size_bytes": 0
+        }
 
-            alloc[node] = []
-            for k in range(1, len(A[node])):
-                pj_ko = util.amdahlM(size, alpha, A[node][ko])
-                pj_k = util.amdahlM(size, alpha, A[node][k])
-                benefit = util.compute_benefit(pj_ko, pj_k, A[node][ko], A[node][k])
-                rel_improvement = util.compute_rel_runtime_improvement(pj_ko, pj_k)
-                if benefit > 0 and rel_improvement >= util.THRESHOLD:
-                    ko = k
-                    alloc[node].append([A[node][k], benefit])
+        compNodeId2Id = {}
+        fakeId2compNode = {}
+        nodeId = 1
+        for node in dag.get_computational_nodes():
+            compNodeId2Id[node.id] = nodeId
+            fakeId2compNode[nodeId] = node
+            nodeId += 1
+        lpcreator = LpCreatorChen13(compNodeId2Id, fakeId2compNode)
+        solver = CplexGlpkSolverChen13()
+        producer = Chen13Producer(compNodeId2Id, fakeId2compNode)
+        stats["lp_write_start"] = time.time()
+        prog_str = lpcreator.create_linear_program(dag, grid)
 
-        L, v_cp = util.compute_L(self.mG)
-        W = util.compute_W(self.mG, self.assign)
-        tl = util.compute_pred_level(self.G)[0]
-        while L > W / self.P:
-            vb, ab, bb = None, self.P, 0.0
-            md = util.computeMd(tl, visited, self.assign)
-            for node in v_cp:
-                if len(alloc[node]) == 0: continue
-                bf, a = alloc[node][0][1], alloc[node][0][0]
-                s = a - self.assign[node]
-                if md[tl[node]] + s <= self.P and bf > bb:
-                    vb, ab, bb = node, a, bf
-            if vb is not None:
-                self.assign[vb] = ab
-                self.mG.nodes[vb]['d_weight'] = util.amdahlM(self.mG.nodes[vb]['weight'], self.mG.nodes[vb]['alpha'],
-                                                             ab)
-                alloc[vb].pop(0)
-                visited[vb] = 1
-                L, v_cp = util.compute_L(self.mG)
-                W = util.compute_W(self.mG, self.assign)
-            else:
-                break
+        out = sys.stdout
+        ofile = f'{self.w}_{self.P}.mod'
+        if ofile is not None:
+            out = open(ofile, "w")
+
+        out.write(prog_str)
+
+        if ofile is not None:
+            out.close()
+
+        lp_out_fname = ofile.replace(".mod", ".sol")
+        solver.solve(ofile, lp_out_fname)
+        res_hash = solver.read_result(lp_out_fname)
+
+        # solution = {} | node.id -> [ psize, time ]
+        solution = producer.get_solution(res_hash, dag, grid, None)
+        stats["lp_write_end"] = time.time()
+        out = sys.stdout
+        if ((len(solution) == 0)):
+            print("No solution found")
+            raise Exception("No solution found")
+        for jobid in solution.keys():
+            print(f"@SOLUTION[task,psize]: {jobid} {solution[jobid][0]}", file=out)
+            nd = str(jobid)
+            self.assign[nd] = int(solution[jobid][0])
+            self.mG.nodes[nd]['d_weight'] = util.amdahlM(self.mG.nodes[nd]['weight'], self.mG.nodes[nd]['alpha'],
+                                                         self.assign[nd])
+
+        with open("runtime.csv", "a", newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(["ckptRight", self.w, self.P, stats["lp_write_end"] - stats["lp_write_start"]])
 
     def shrink_mapping(self):
         ticks = []
@@ -154,14 +169,17 @@ class CkptChainOptimization(Strategy):
                 ns.extend(self.node2chain[node])
             self.schedule[i] = ns
 
-   # checkpoint tasks with crossover dependences / checkpoint chain by DP
+    # checkpointnew tasks with crossover dependencies / checkpointnew chain by DP
     def checkpoint(self):
         tmpCkpt = []  # tasks to be checkpointed
         noCkpt = []
         for node in self.mG.nodes:
             L = self.node2chain[node]
             if len(L) > 1:
+                dp_s = time.perf_counter()
                 self.ckpt.update(self.ckpt_chain(L, self.assign[L[0]]))
+                dp_e = time.perf_counter()
+                self.dp_time += (dp_e - dp_s)
             else:
                 tag = False
                 if self.G.out_degree(node) == 0:
@@ -200,21 +218,23 @@ class CkptChainOptimization(Strategy):
                     if succ not in self.schedule[p][lastCkpt + 1:curr + 1]:
                         fs.update(self.G.edges[self.schedule[p][i], succ]['filelist'])
             self.ckpt[node][0] = 1
-            self.ckpt[node][1] = sum(fs.values()) * self.ccc
-            self.ckpt[node][2] = sum(fs.values()) * self.vvv
+            self.ckpt[node][1] = sum(fs.values()) * self.gamma
+            self.ckpt[node][2] = sum(fs.values()) * self.eta
 
-    def ckpt_chain(self, L, assign_p):  # checkpoint linear chain
+    def ckpt_chain(self, L, assign_p):  # checkpointnew linear chain
         Exp = [[[inf for k in range(4)] for i in range(0, len(L) + 1)] for j in range(0, len(L) + 1)]
         Exp[0][0] = [0, 1, 0, 0]
         ckpt = {}
+        prefix_w, C, R = util.pre_compute_RTC(L, self.G)
         for i in range(1, len(L) + 1):
             for j in range(0, i):
-                w, rv = util.T(j, i, L, self.G)
-                c = util.C(j, i, L, self.G)
+                w = prefix_w[i] - prefix_w[j]
+                c = C[L[i - 1]]
+                rv = R[L[j]]
                 v = c
-                c *= self.ccc
-                v *= self.vvv
-                rv *= self.ccc
+                c *= self.gamma
+                v *= self.eta
+                rv *= self.gamma
                 exp_weight = math.exp(self.lam * assign_p * w) * (w + v + rv) + c - rv
                 Exp[i][j][1] = 1
                 Exp[i][j][2] = c
@@ -250,7 +270,7 @@ class CkptChainOptimization(Strategy):
                         index += 1
                     L.append(self.schedule[proc[0]][index])
                 visited.extend(L)
-                op = self.find_opt2ckpt(L,self.assign[node])
+                op = self.find_opt2ckpt(L, self.assign[node])
                 sub = self.assign[node] - op
                 minstart = 0
                 if self.G.in_degree(node) > 0:
@@ -280,17 +300,17 @@ class CkptChainOptimization(Strategy):
                         lasttime[p] = minstart
         self.schedule = new_schedule
 
-    def find_opt2ckpt(self, L,max_p):
+    def find_opt2ckpt(self, L, max_p):
         w = [self.G.nodes[node]['weight'] for node in L]
         alpha = [self.G.nodes[node]['alpha'] for node in L]
         bestP = 1
         f = util.C(0, len(L), L, self.G)
-        V = f * self.vvv
-        C = f * self.ccc
-        R = util.R(0, len(L), L, self.G) * self.ccc
+        V = f * self.eta
+        C = f * self.gamma
+        R = util.R(0, len(L), L, self.G) * self.gamma
         runtime = util.amdahlM(w, alpha, 1)
         minE = math.exp(self.lam * runtime) * (runtime + V + R) + C - R
-        for i in range(2, max_p+1):
+        for i in range(2, max_p + 1):
             nw = util.amdahlM(w, alpha, i)
             E = math.exp(self.lam * i * nw) * (nw + V + R) + C - R
             if E < minE:
@@ -310,18 +330,21 @@ class CkptChainOptimization(Strategy):
         return minStart + runtime
 
     def get_schedule(self, outdir):
+        start = time.perf_counter()
         self.merge_chain2node()
         self.allocation()
         self.shrink_mapping()
         self.decompose()
         self.checkpoint()
         self.reduce()
+        end = time.perf_counter()
         filename = f"{outdir}/4_{self.w}_{self.P}_{self.p_fail}_{self.ccr:.1e}.csv"
         self.output2csv(filename)
+        return end - start, self.dp_time, self.get_makespan()
 
     def get_makespan(self):
         ft = {}
-        mp_nodes=[]
+        mp_nodes = []
         for node in self.mapping_order:
             mp_nodes.extend(self.node2chain[node])
         avail = [0 for _ in range(len(self.schedule))]
